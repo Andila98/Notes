@@ -1,0 +1,308 @@
+# ZKTeco Attendance Bridge — Server Migration & Troubleshooting Notes
+
+**Stack:** Django + Gunicorn (Unix socket) + Celery/Redis + PostgreSQL + Nginx, `pyzk` for ZKTeco F18 device communication
+**OS:** Ubuntu 26.04 LTS
+**Scope:** Migration of the attendance bridge to a new on-prem server, debugging of sync failures, and dual-IP network failover setup.
+
+> All IPs, MAC addresses, hostnames, credentials, and identifiers below are placeholders.
+
+---
+
+## 1. Environment Overview
+
+| Component | Detail |
+|---|---|
+| App server | `<SERVER_IP>` (on-prem, Ubuntu 26.04) |
+| Biometric device | ZKTeco F18 at `<DEVICE_IP>:4370` (UDP) |
+| Database | PostgreSQL, bound to `127.0.0.1:5432` (local-only) |
+| Task queue | Celery + Redis (`redis://localhost:6379/0`) |
+| App root | `/var/www/systems/zkteco-f18-attendance-bridge` |
+| Services | `zk-bridge` (Gunicorn web), `zk-worker` (Celery worker), `zk-beat` (Celery beat) |
+
+---
+
+## 2. Migration Steps
+
+### 2.1 Database dump & restore
+
+```bash
+# On old server
+pg_dump -U <DB_USER> -d <DB_NAME> -F c -b -v -f attendance_bridge_backup.dump
+
+# Transfer
+scp attendance_bridge_backup.dump <USER>@<SERVER_IP>:/tmp/
+
+# On new server
+pg_restore -U <DB_USER> -d <DB_NAME> -v /tmp/attendance_bridge_backup.dump
+```
+
+### 2.2 Codebase & environment
+
+```bash
+git clone <REPOSITORY_URL> /var/www/systems/zkteco-f18-attendance-bridge
+cd /var/www/systems/zkteco-f18-attendance-bridge
+# Create .env with DB credentials, CRM endpoint, device settings
+```
+
+Key `.env` values (DB is local-only, so the host must be loopback — not the LAN IP):
+
+```
+DB_HOST=127.0.0.1
+DB_PORT=5432
+CRM_API_URL=<CRM_DOMAIN>
+```
+
+### 2.3 Systemd service (final version)
+
+`/etc/systemd/system/zk-bridge.service` — uses `RuntimeDirectory` so `/run/zk-bridge/` is created with correct permissions on start and cleaned up on stop:
+
+```ini
+[Unit]
+Description=ZKTeco Attendance Bridge Web Server
+After=network.target postgresql.service redis.service
+
+[Service]
+User=<SERVICE_USER>
+Group=www-data
+WorkingDirectory=/var/www/systems/zkteco-f18-attendance-bridge
+EnvironmentFile=/var/www/systems/zkteco-f18-attendance-bridge/.env
+RuntimeDirectory=zk-bridge
+ExecStart=/var/www/systems/zkteco-f18-attendance-bridge/.venv/bin/gunicorn \
+    --workers 3 \
+    --bind unix:/run/zk-bridge/zk-bridge.sock \
+    --umask 007 \
+    --timeout 300 \
+    attendance_bridge.wsgi:application
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+```
+
+### 2.4 Nginx reverse proxy
+
+`/etc/nginx/sites-available/zk-bridge` — listens on both server IPs, serves static/media directly, proxies the rest to the Gunicorn socket:
+
+```nginx
+server {
+    listen 80;
+    server_name <SERVER_IP> <SECONDARY_IP>;
+    client_max_body_size 10M;
+
+    location /static/ {
+        alias /var/www/systems/zkteco-f18-attendance-bridge/staticfiles/;
+    }
+
+    location /media/ {
+        alias /var/www/systems/zkteco-f18-attendance-bridge/media/;
+    }
+
+    location / {
+        include proxy_params;
+        proxy_pass http://unix:/run/zk-bridge/zk-bridge.sock;
+    }
+}
+```
+
+Django must allow both hosts:
+
+```python
+ALLOWED_HOSTS = ['<SERVER_IP>', '<SECONDARY_IP>', 'localhost', '127.0.0.1']
+```
+
+Enable and apply:
+
+```bash
+sudo ln -s /etc/nginx/sites-available/zk-bridge /etc/nginx/sites-enabled/
+sudo nginx -t
+sudo systemctl daemon-reload
+sudo systemctl restart zk-bridge nginx
+```
+
+---
+
+## 3. Issues Encountered & Resolutions
+
+### Issue 1 — Device unreachable on old IP
+
+**Symptom:** `nc -zv <OLD_DEVICE_IP> 4370` → connection refused.
+**Diagnosis:** Device had moved; `nc -zv <DEVICE_IP> 4370` succeeded.
+**Resolution:** Point the bridge at the correct device IP; later added application-level IP failover (see §5).
+
+### Issue 2 — `postgresql.service` shows `active (exited)`
+
+**Not a bug.** On Ubuntu, `postgresql.service` is a dummy wrapper (`ExecStart=/bin/true`); the real DB runs under a versioned unit (e.g. `postgresql@16-main`). Confirm the DB is actually listening with:
+
+```bash
+ss -nltp | grep 5432
+# LISTEN 127.0.0.1:5432  → up, local-only binding (correct for same-host Django)
+```
+
+### Issue 3 — 500 Internal Server Error on manual sync
+
+**Symptom:** Frontend received Django's HTML 500 page instead of JSON when triggering an attendance sync.
+**Diagnosis:** `sudo journalctl -u zk-bridge -f` showed the pyzk chunk receive (`self.__sock.recv(1024+8)`) being interrupted by Gunicorn's `handle_abort` → `SystemExit: 1`. Downloading the full device log takes longer than Gunicorn's **default 30-second worker timeout**, so Gunicorn assumed the worker had frozen and killed it mid-download.
+**Resolution:** Added `--timeout 120` to the Gunicorn `ExecStart`, then `daemon-reload` + restart.
+
+**Follow-up:** Worker was still killed — but the log timestamps showed exactly a 2-minute gap between start and kill, proving the new timeout *was* active and simply still too short for the backlog. Raised to `--timeout 300`.
+
+**Lesson:** Check service uptime after config changes — the first edit hadn't taken effect because the daemon was never reloaded/restarted (uptime still showed months).
+
+### Issue 4 — Sync silently stops after connecting
+
+**Symptom:** After the timeout fix, logs showed a clean connect then nothing:
+
+```
+device_utils Trying primary connection to ZKTeco device (<DEVICE_IP>):4370
+device_utils Successfully connected to ZKTeco device via primary IP
+device_utils Device disabled for sync
+```
+
+**Diagnosis:** Not a timeout at all — the device record was flagged **disabled** in the application (Django admin device model and/or a `.env` toggle).
+**Resolution:** Re-enable the device in Django admin; verify no global kill-switch in `.env` (`grep SYNC .env`).
+
+**Lesson:** Read the last log line literally before assuming infrastructure. The "timeout" era was over; this was an application-level flag.
+
+### Issue 5 — Celery worker looping on CRM sync
+
+**Symptom:** `zk-worker` retry-looping with:
+
+```
+NameResolutionError: Failed to resolve '<PLACEHOLDER_CRM_DOMAIN>' — Name or service not known
+```
+
+**Diagnosis:** The CRM endpoint env var still contained the placeholder domain from the template `.env` after migration.
+**Resolution:** Set the real CRM API domain in `.env`, then `sudo systemctl restart zk-worker`. *(Outstanding at time of writing.)*
+
+### Issue 6 — Missing service unit name
+
+`systemctl status zkteco_beat.service` → unit not found. Actual unit name was `zk-beat`. Started and enabled it explicitly:
+
+```bash
+sudo systemctl enable --now zk-beat
+```
+
+---
+
+## 4. Application-Level Device IP Failover
+
+To survive device IP conflicts without manual edits, the connection logic iterates a list of candidate IPs with a short per-attempt timeout (so failed attempts don't trip the Gunicorn worker timeout):
+
+```python
+from zk import ZK
+import logging
+
+logger = logging.getLogger(__name__)
+
+DEVICE_IPS = ["<DEVICE_IP>", "<DEVICE_FALLBACK_IP>"]
+PORT = 4370
+
+def get_device_connection():
+    for ip in DEVICE_IPS:
+        try:
+            logger.info(f"Attempting connection to ZKTeco device at {ip}:{PORT}...")
+            zk = ZK(ip, port=PORT, timeout=10, password=<DEVICE_PASSWORD>, force_udp=True)
+            connection = zk.connect()
+            logger.info(f"Connected to ZKTeco device at {ip}:{PORT}")
+            return connection, zk
+        except Exception as e:
+            logger.warning(f"Failed to connect to {ip}:{PORT}: {e}")
+            continue
+    raise ConnectionError("Could not connect to any configured device IP.")
+```
+
+Note: `pyzk` also accepts a `timeout=` on the `ZK()` constructor — if long downloads still fail after raising Gunicorn's timeout, raise the socket timeout there too.
+
+---
+
+## 5. Server-Side Dual-IP Failover (Netplan)
+
+**Goal:** Bind two static IPs (`<SERVER_IP>` primary, `<SECONDARY_IP>` secondary) to one NIC so the server stays reachable if one IP is hit by a LAN address conflict.
+
+### 5.1 Root cause found first: conflicting Netplan files
+
+`sudo cat /etc/netplan/*.yaml` revealed **three competing configs** fighting over the same interface:
+
+1. Installer config (`networkd` renderer) assigning one IP
+2. A "NetworkManager manages everything" catch-all
+3. An auto-generated NetworkManager profile assigning a different IP
+
+This renderer conflict explained the earlier flaky connectivity.
+
+### 5.2 Quarantine the extras
+
+```bash
+sudo mkdir -p /etc/netplan/backup
+sudo mv /etc/netplan/01-network-manager-all.yaml /etc/netplan/backup/
+sudo mv /etc/netplan/90-NM-<UUID>.yaml /etc/netplan/backup/
+```
+
+### 5.3 Single consolidated config
+
+`/etc/netplan/00-installer-config.yaml`:
+
+```yaml
+network:
+  version: 2
+  renderer: networkd
+  ethernets:
+    <IFACE>:                # e.g. eno1 — find with `ip a`
+      match:
+        macaddress: <MAC_ADDRESS>
+      set-name: <IFACE>
+      dhcp4: no
+      dhcp6: no
+      addresses:
+        - <SERVER_IP>/24
+        - <SECONDARY_IP>/24
+      routes:
+        - to: default
+          via: <GATEWAY_IP>
+      nameservers:
+        addresses: [8.8.8.8, 1.1.1.1]
+```
+
+### 5.4 Apply safely over SSH
+
+```bash
+sudo netplan try   # auto-rolls back after 120s if you lose connectivity
+# Press Enter to commit — pressing Enter during `try` makes it permanent;
+# a separate `netplan apply` is NOT needed afterwards.
+```
+
+Keeping the current SSH IP in the `addresses` list means the active session survives the change.
+
+### 5.5 Enable the renderer
+
+Because the system previously relied on NetworkManager, `systemd-networkd` wasn't running:
+
+```bash
+sudo systemctl enable --now systemd-networkd
+```
+
+### 5.6 Verify
+
+```bash
+ip a show dev <IFACE>
+# Expect both:
+#   inet <SERVER_IP>/24    scope global
+#   inet <SECONDARY_IP>/24 scope global secondary
+```
+
+---
+
+## 6. Key Takeaways
+
+1. **Gunicorn default timeout (30s) kills long-running device downloads.** Raise `--timeout` for sync workloads — or better, move long device pulls into Celery tasks so web workers never block.
+2. **`active (exited)` on Ubuntu's `postgresql.service` is normal** — verify with `ss -nltp`, not unit status.
+3. **Config changes need `daemon-reload` + restart** — confirm via service uptime.
+4. **Read the final log line before assuming infrastructure failure** — a "disabled for sync" application flag masqueraded as a timeout for a while.
+5. **Multiple Netplan files with mixed renderers cause silent conflicts** — consolidate to one file, one renderer.
+6. **`netplan try` is the safe way to change network config over SSH** — 120s automatic rollback.
+7. **Post-migration checklist should include every `.env` placeholder** — a leftover template domain caused an infinite Celery retry loop.
+
+## 7. Outstanding
+
+- [ ] Set the real CRM API domain in `.env` and restart `zk-worker`
+- [ ] Consider moving device log downloads fully into Celery (removes the Gunicorn timeout coupling)
+- [ ] Optionally clear old attendance logs on the device to shrink download payloads
